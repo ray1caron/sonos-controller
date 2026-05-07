@@ -1,3 +1,55 @@
+# Claude Code local settings — machine-specific allowlist, never commit
+.claude/settings.local.json
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*credential*
+*credentials*
+auth_token
+.token
+
+# Pi runtime data — only writeable from the container, never source-of-truth
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.tar.gz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# SQLite library cache (regenerated at runtime)
+library.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# === Inherited from TinySonos upstream ===
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://claude.com/schemas/settings.json",
+  "_comment": "Defence-in-depth deny-list for the Sonos Controller PWA frontend. See CLAUDE.md > Things to NEVER do for the rationale.",
+
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+
+      "Read(**/secrets/*)",
+      "Read(**/*credential*)",
+      "Read(**/*password*)",
+
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa*)",
+      "Read(**/id_ed25519*)",
+
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.netrc)",
+
+      "Bash(curl * | sh*)",
+      "Bash(wget * | sh*)",
+      "Bash(curl * | bash*)",
+      "Bash(wget * | bash*)",
+
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+
+      "Bash(git push --force*)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard origin/main)"
+    ]
+  },
+
+  "autoMemoryEnabled": true
+}

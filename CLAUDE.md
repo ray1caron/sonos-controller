@@ -1,788 +1,187 @@
-# AI Development Guidelines for TinySonos
+# Sonos Local Library Controller — Backend
 
-This document provides guidelines for AI assistants (Claude, GPT, etc.) contributing to the TinySonos project. It captures the patterns, practices, and architectural decisions that have made this project successful.
+This repo is a fork of [jasonacox/TinySonos](https://github.com/jasonacox/TinySonos) (MIT licensed) that becomes the backend for a self-hosted Sonos controller. The frontend lives in a separate repo (`sonos-controller-pwa`). The full specification is in `docs/PRD.md`. The build journey is in `docs/BuildGuide.md`.
 
----
+This CLAUDE.md is the **operating manual** for working in this repo. The PRD is the spec; this file is how Claude Code should behave while implementing it.
 
-## Project Philosophy
+## What this project is
 
-### Core Principles
+- A Python backend that controls Sonos speakers via SoCo, exposing a REST + SSE API for an iPhone PWA frontend.
+- Runs in Docker on a dedicated Raspberry Pi 4 (production) or on the developer's Ubuntu workstation (dev/test).
+- The Pi is on the same VLAN as the speakers, the QNAP NAS, and the iPhone. UPnP discovery does not cross VLANs in this setup.
+- Audio data **never** flows through the Pi. Speakers stream directly from the NAS via `x-file-cifs://` URIs.
 
-1. **Reliability Over Features** - Skip-free playback is non-negotiable
-2. **Single Responsibility** - Each component has one clear purpose
-3. **Backward Compatibility** - Feature flags enable safe rollback
-4. **Observable Behavior** - Extensive logging and statistics
-5. **User-Centric Design** - UI responsiveness and feedback matter
+## Architectural principles (in priority order)
 
-### Development Mantras
+1. **Speed is the feature.** Volume changes feel instantaneous. Library searches return in <500ms. Anything that compromises responsiveness is a bug, not a tradeoff.
+2. **NAS-first.** The local music library is the headline experience. Streaming services are out of scope for v1.
+3. **Minimum taps.** Common actions take one tap; nothing common takes more than three.
+4. **Reliability through simplicity.** The Pi runs only this service. The container restarts unless-stopped. The OS root is read-only. SD-card corruption is not a failure mode we accept.
 
-- "Make it work, make it right, make it fast" - in that order
-- "If it's not tested, it's broken"
-- "Race conditions are eliminated, not mitigated"
-- "Sonos hardware is unreliable, plan accordingly"
+## Build strategy: this is a fork, not a from-scratch build
 
----
+We inherit the SoCo wrapper, discovery, transport, volume, SSE stream, multi-room grouping, queue primitives, Docker host networking, and M3U parsing from TinySonos. We add bearer-token auth, the SQLite library cache, `x-file-cifs://` URI rewriting, the watchdog, and a new iPhone-first PWA frontend. We remove the legacy HTTP file server, the Plex export tools, and the original web UI.
 
-## Architecture Patterns
+Section 4.2 of `docs/PRD.md` is the authoritative reuse-vs-change boundary. **Before adding any new module, check whether something equivalent already exists in the upstream code.** Don't reinvent.
 
-### Command-Queue Pattern
+For general-purpose fixes that aren't project-specific (SoCo wrapper improvements, Docker fixes, performance work), draft an upstream PR to jasonacox/TinySonos as a courtesy. Project-specific changes (the new frontend, the SQLite cache, bearer-token auth, x-file-cifs rewriting) stay in the fork.
 
-**Always use command queues for state-modifying operations.**
+## Tech stack
 
-```python
-# ✅ CORRECT - Serialize through command queue
-adapter.enqueue_next()  # Returns immediately
-# Command processed async by controller
+- **Language:** Python 3.12+
+- **Web framework:** FastAPI (or whatever TinySonos uses — check before changing)
+- **Sonos control:** SoCo (pinned in `pyproject.toml` — do not auto-bump)
+- **Library cache:** SQLite (single file on the writeable `/data` volume)
+- **Container:** Docker with `network_mode: host`, multi-arch (linux/amd64 dev, linux/arm64 prod)
+- **Auth:** Bearer token in the `Authorization` header on every `/api/*` endpoint
 
-# ❌ WRONG - Direct manipulation causes races
-self.musicqueue.pop()
-self.sonos.play_uri(song)
-```
+## Conventions
 
-**Rationale:** Single-threaded command processing eliminates all race conditions. The queue ensures operations are serialized and predictable.
+### API shape
 
-### State Management
+- All endpoints are prefixed `/api/`. The canonical shape is in PRD section 10.
+- Use RESTful paths: `/api/rooms/{id}/play`, not `/play?room=X`.
+- During the migration from TinySonos's original paths, keep legacy aliases working but don't add new endpoints under the old shape.
+- JSON in, JSON out. Empty success responses are HTTP 204.
 
-**Controller owns the truth, Sonos is unreliable.**
+### Code
 
-```python
-# ✅ CORRECT - Trust controller state
-if self.state == "PLAYING":
-    self._handle_next()
-
-# ❌ WRONG - Sonos state can be stale/wrong
-sonos_state = self.sonos.get_current_transport_info()
-if sonos_state == "PLAYING":  # Unreliable!
-```
-
-**Rationale:** Sonos hardware reports inconsistent state. Controller maintains internal state and overrides Sonos when necessary.
-
-### Monitoring Pattern
-
-**Aggressive polling handles Sonos instability.**
-
-```python
-# ✅ CORRECT - Poll frequently (0.5s)
-while self.running:
-    current_state = self.sonos.get_current_transport_info()
-    # Detect changes, auto-play, take over
-    time.sleep(0.5)
-
-# ❌ WRONG - Rely on events alone
-self.sonos.subscribe()  # Events are missed!
-```
-
-**Rationale:** Sonos event subscriptions are unreliable. Polling every 0.5s ensures we catch state changes and song endings.
-
----
-
-## Code Organization
-
-### File Structure
-
-```
-TinySonos/
-├── server.py           # HTTP server, API gateway
-├── src/
-│   ├── controller.py   # Playback controller (single thread)
-│   ├── adapter.py      # Backward compatibility bridge
-│   └── commands.py     # Command system
-├── web/
-│   ├── index.html      # Main UI
-│   └── style.css       # Styling
-├── tools/              # Utility scripts
-├── tests/              # Test suite
-└── media/              # Music library
-```
-
-### Module Responsibilities
-
-**server.py:**
-- HTTP request handling
-- SSE event broadcasting
-- Static file serving
-- Feature flag management
-- **NEVER** direct Sonos manipulation (use adapter)
-
-**controller.py:**
-- Command processing
-- Queue management
-- Sonos control
-- State tracking
-- Monitoring thread
-- **NEVER** HTTP logic (callbacks only)
-
-**adapter.py:**
-- API translation
-- Command queueing
-- State queries
-- **NEVER** modify controller internals directly
-
-**commands.py:**
-- Command definitions
-- Queue implementation
-- **NEVER** business logic
-
----
-
-## Coding Standards
+- Run `ruff` and `black` on every change. Never commit unformatted code.
+- Type hints on all new functions. Existing untyped TinySonos code can stay untyped during Phase 1; add types as you touch it in later phases.
+- Prefer SoCo's high-level methods (`play_uri`, `add_to_queue`, `join`) over raw SOAP. If SoCo doesn't expose what you need, ask whether the goal is in scope before reaching for `soap_client`.
 
 ### Logging
 
-**Use appropriate log levels:**
+- Structured JSON to stdout, consumed by `docker logs`.
+- Levels: `INFO` for normal operation, `WARNING` for recoverable issues, `ERROR` for failures, `DEBUG` only behind a flag.
+- Never log the bearer token, even at DEBUG. Never log NAS credentials. Redact path segments that might contain user identifiers.
 
-```python
-# Debug - verbose operational details
-log.debug("Processing command: NEXT")
+### Tests
 
-# Info - significant events
-log.info("Queue was empty, auto-starting playback")
+- `pytest` with `tests/smoke/` for integration tests against a real speaker, `tests/unit/` for pure logic.
+- Smoke tests are slow and require a real speaker on the LAN. Tag them `@pytest.mark.smoke` and exclude from the default run.
+- After every meaningful change, run the smoke suite. A regression here is a stop-everything bug.
 
-# Warning - recoverable issues
-log.warning("Sonos state check failed, retrying")
+### Commits and branches
 
-# Error - serious problems
-log.error(f"Failed to play song: {e}")
+- One atomic commit per logical change. GSD's `/gsd-execute-phase` produces one commit per task — that's the right granularity.
+- Conventional commit prefixes: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`. Plus `from-upstream:` when cherry-picking from TinySonos.
+- Branch names follow GSD's `phase-N-task-M` pattern. PRs from `/gsd-ship` go to `main`.
+
+## Security and secrets
+
+The agent runs with `--dangerously-skip-permissions` for workflow speed. Defence-in-depth lives in the deny-list in `.claude/settings.json`. Specifically:
+
+- **NEVER** read `.env`, `.env.*`, `**/secrets/*`, `**/*credential*`, `**/*.pem`, `**/*.key`, or `/data/token`. The deny-list enforces this; this rule reinforces the intent.
+- **NEVER** commit secrets, even briefly. The bearer token is generated at first run on the Pi and lives in `/data/token`, which is in `.gitignore`.
+- **NEVER** log a request's `Authorization` header or its decoded contents.
+- **NEVER** add a third-party telemetry, analytics, or crash-reporting library. The system is LAN-only and stays that way.
+
+## Pi access
+
+The Pi is `sonos-controller.local` (mDNS) or its pinned IP via UDM Pro DHCP reservation (typically `192.168.1.50`). Access is via SSH using the dedicated key `~/.ssh/sonos_controller_key`. The `~/.ssh/config` alias `sonos-controller` lets you write `ssh sonos-controller`.
+
+Standard deploy from the workstation:
+```
+docker buildx build --platform linux/arm64 -t sonos-controller:latest --load .
+docker save sonos-controller:latest | ssh sonos-controller "docker load"
+ssh sonos-controller "cd ~/sonos-controller && docker compose up -d"
 ```
 
-**Include context in logs:**
-
-```python
-# ✅ GOOD - Helpful context
-log.info(f"Added {len(songs)} songs from album {album_id}")
-
-# ❌ BAD - No context
-log.info("Added songs")
+For OS package updates (read-only root requires a temporary remount):
+```
+ssh sonos-controller "sudo overlayroot-chroot"
+# inside the chroot:
+apt update && apt upgrade -y
+exit
+ssh sonos-controller "sudo reboot"
 ```
 
-### Error Handling
+Do not edit files on the Pi directly. All source-of-truth changes happen on the workstation, get committed, get built into a new image, get deployed. The Pi has no editor more capable than `vi` for a reason.
 
-**Handle Sonos instability gracefully:**
+## GSD workflow
 
-```python
-# ✅ CORRECT - Expect failures
-try:
-    self.sonos.play_uri(song['path'])
-except Exception as e:
-    log.error(f"Playback failed: {e}")
-    # Retry logic or fail gracefully
+This project uses GSD v1 for spec-driven development. The phase structure mirrors PRD section 12. Each phase = one GSD cycle:
 
-# ❌ WRONG - Assume success
-self.sonos.play_uri(song['path'])  # Can fail!
-```
+1. `/gsd-discuss-phase N` — capture preferences before planning
+2. `/gsd-plan-phase N` — generate atomic task plans
+3. `/gsd-execute-phase N` — run plans in waves, atomic commit per task
+4. `/gsd-verify-work N` — user-acceptance pass
+5. `/gsd-ship N` — clean PR branch
 
-**Return meaningful errors to clients:**
+The `.planning/` directory holds the durable planning state (PROJECT.md, REQUIREMENTS.md, ROADMAP.md, STATE.md, plus per-phase plans). It is committed to git.
 
-```python
-# ✅ GOOD - Actionable error
-return json.dumps({
-    "error": "Album not found in database",
-    "album_id": album_id
-})
+For ad-hoc work outside the phase structure, use `/gsd-quick`. Don't try to fit one-off bugfixes into a full phase ceremony.
 
-# ❌ BAD - Cryptic
-return json.dumps({"error": "Error"})
-```
+## Things to NEVER do
 
-### Threading
+- **NEVER** stream audio through the Pi. URIs sent to speakers must be `x-file-cifs://NAS/Music/...`, never `http://localhost:...`.
+- **NEVER** add streaming-service support (Spotify, Apple Music, Tidal, etc.). Out of scope for v1 per PRD section 2.3.
+- **NEVER** add functionality that requires the Pi to reach the public internet. The system is LAN-only.
+- **NEVER** persist state to the Pi's root filesystem. Only `/data` is writeable.
+- **NEVER** reach across VLAN boundaries. If a request needs a thing on another VLAN, the answer is "put both on the same VLAN," not "configure multicast routing."
+- **NEVER** suppress a SoCo exception silently. If SoCo says discovery failed, surface it.
+- **NEVER** commit changes to `.planning/STATE.md` outside of GSD's normal flow. The agent owns that file.
+- **NEVER** modify the LICENSE file or remove the upstream-attribution paragraph from the README. The MIT terms inherited from TinySonos are non-negotiable.
 
-**Minimize thread creation:**
+## References
 
-```python
-# ✅ GOOD - Single monitoring thread
-self.monitor_thread = threading.Thread(
-    target=self._monitor_playback,
-    daemon=True
-)
+- Full specification: `docs/PRD.md` (section 4.2 = fork strategy, section 10 = API spec, section 11 = data model, section 12 = build plan)
+- Build journey: `docs/BuildGuide.md`
+- Upstream project: https://github.com/jasonacox/TinySonos
+- Path-scoped rules: `.claude/rules/`
 
-# ❌ BAD - Thread per operation
-for song in queue:
-    threading.Thread(target=self.play, args=(song,)).start()
-```
+## Path-scoped rules (loaded automatically when working in matching paths)
 
-**Use thread-safe primitives:**
+- `.claude/rules/backend-python.md` — Python-specific conventions for `src/**`, `tests/**`
+- `.claude/rules/deployment.md` — deployment, Docker, and Pi-specific rules for `Dockerfile`, `docker-compose*.yml`, `deploy/**`
 
-```python
-# ✅ GOOD - queue.Queue is thread-safe
-from queue import Queue
-self.command_queue = Queue()
+<!-- GSD:project-start source:PROJECT.md -->
+## Project
 
-# ❌ BAD - Lists aren't thread-safe for concurrent access
-self.command_list = []  # Race condition!
-```
+Project not yet initialized. Run /gsd-new-project to set up.
+<!-- GSD:project-end -->
 
----
+<!-- GSD:stack-start source:STACK.md -->
+## Technology Stack
 
-## API Design
+Technology stack not yet documented. Will populate after codebase mapping or first phase.
+<!-- GSD:stack-end -->
 
-### Endpoint Patterns
+<!-- GSD:conventions-start source:CONVENTIONS.md -->
+## Conventions
 
-**Use consistent naming:**
+Conventions not yet established. Will populate as patterns emerge during development.
+<!-- GSD:conventions-end -->
 
-- `/play`, `/pause`, `/stop` - Actions (verbs)
-- `/state`, `/queue`, `/playing` - Resources (nouns)
-- `/toggle/repeat` - Toggles
-- `/album/123`, `/speaker/10.0.1.100` - Resource ID paths
+<!-- GSD:architecture-start source:ARCHITECTURE.md -->
+## Architecture
 
-**Return consistent JSON:**
+Architecture not yet mapped. Follow existing patterns found in the codebase.
+<!-- GSD:architecture-end -->
 
-```python
-# ✅ GOOD - Consistent structure
-{"Response": "OK", "queue_depth": 5}
+<!-- GSD:skills-start source:skills/ -->
+## Project Skills
 
-# ❌ BAD - Inconsistent
-"OK"  # Plain string
-```
+No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
+<!-- GSD:skills-end -->
 
-### SSE Events
+<!-- GSD:workflow-start source:GSD defaults -->
+## GSD Workflow Enforcement
 
-**Name events by what changed:**
+Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
 
-- `track_changed` - New song started
-- `playback_state` - State changed
-- `queue_changed` - Queue modified
-- `volume_changed` - Volume adjusted
+Use these entry points:
+- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
+- `/gsd-debug` for investigation and bug fixing
+- `/gsd-execute-phase` for planned phase work
 
-**Include complete state in events:**
+Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
+<!-- GSD:workflow-end -->
 
-```python
-# ✅ GOOD - Self-contained
-sse_broadcast('track_changed', {
-    'title': song['title'],
-    'artist': song['artist'],
-    'album': song['album'],
-    'album_art': song.get('album_art', ''),
-    'duration': song.get('duration', '0:00:00')
-})
+<!-- GSD:profile-start -->
+## Developer Profile
 
-# ❌ BAD - Requires additional fetch
-sse_broadcast('track_changed', {'song_id': '123'})
-```
-
----
-
-## Frontend Patterns
-
-### SSE + Polling Hybrid
-
-**Use SSE for instant updates, polling for safety:**
-
-```javascript
-// ✅ GOOD - Hybrid approach
-eventSource.addEventListener('track_changed', updateUI);
-setInterval(showprogress, 2000);  // Fallback polling
-
-// ❌ BAD - Polling only (wasteful) or SSE only (fragile)
-```
-
-### XML Metadata Fallback
-
-**Parse XML when structured data missing:**
-
-```javascript
-// ✅ GOOD - Fallback to XML
-let title = data.title;
-if (!title && data.metadata) {
-    const xml = parser.parseFromString(data.metadata, "text/xml");
-    title = xml.getElementsByTagName("dc:title")[0]?.textContent;
-}
-
-// ❌ BAD - Assume structured data always present
-document.querySelector(".title").innerHTML = data.title;  // Might be empty!
-```
-
-### State Indicators
-
-**Distinguish controller state from hardware state:**
-
-```javascript
-// ✅ GOOD - Show both states
-if (data.sonos_state === 'PLAYING' && data.state === 'STOPPED') {
-    showExternalSourceIndicator();
-}
-
-// ❌ BAD - Confuse the two
-if (data.state === 'PLAYING') {
-    // Which state? Controller or Sonos?
-}
-```
-
----
-
-## Testing Practices
-
-### Use Mock Objects
-
-**Test without hardware:**
-
-```python
-# ✅ GOOD - Mock Sonos
-from tests.mock_sonos import MockSonos
-controller = PlaybackController(sonos=MockSonos(), ...)
-
-# ❌ BAD - Require real speaker
-controller = PlaybackController(sonos=real_sonos, ...)  # Brittle!
-```
-
-### Test Critical Paths
-
-**Focus on race-prone operations:**
-
-1. Multiple `/next` calls in sequence
-2. Queue operations during playback
-3. External source takeover
-4. Song ending detection
-5. Auto-play triggers
-
-### Integration Tests
-
-**Verify endpoint integration:**
-
-```python
-# Test that endpoint routes to adapter correctly
-response = requests.get('http://localhost:8000/next')
-assert response.json()['Response'] == 'OK'
-# Check command was queued
-assert controller.command_queue.qsize() > 0
-```
-
----
-
-## Common Pitfalls
-
-### ❌ Race Conditions
-
-```python
-# WRONG - Two threads modifying same data
-def jukebox_thread():
-    song = musicqueue.pop()  # Thread 1
-    
-def handle_next():
-    song = musicqueue.pop()  # Thread 2
-    # Both threads might get same song!
-```
-
-**Fix:** Use command queue pattern.
-
-### ❌ Trusting Sonos State
-
-```python
-# WRONG - Sonos state can be stale
-if sonos.get_current_transport_info()['current_transport_state'] == 'PLAYING':
-    # Might be wrong!
-```
-
-**Fix:** Track state internally in controller.
-
-### ❌ Blocking Operations in Main Thread
-
-```python
-# WRONG - Blocks request processing
-def do_get(self):
-    time.sleep(5)  # Blocks all other requests!
-```
-
-**Fix:** Use async commands or background threads.
-
-### ❌ Missing XML Fallback
-
-```python
-# WRONG - Assumes title always populated
-title = track_info['title']  # Might be empty!
-```
-
-**Fix:** Parse from metadata XML when missing.
-
-### ❌ Forgetting Auto-Play Logic
-
-```python
-# WRONG - Add to queue but don't start
-musicqueue.extend(songs)
-# If queue was empty, nothing will play!
-```
-
-**Fix:** Check if queue was empty and auto-start.
-
----
-
-## Feature Flag Pattern
-
-### Adding New Features
-
-**Always add feature flags for major changes:**
-
-```python
-# In server.py
-USE_NEW_FEATURE = os.getenv('USE_NEW_FEATURE', 'false').lower() == 'true'
-
-# Dual code paths
-if USE_NEW_FEATURE:
-    new_implementation()
-else:
-    legacy_implementation()
-```
-
-**Benefits:**
-- Instant rollback capability
-- A/B testing
-- Gradual rollout
-- Risk mitigation
-
-### Feature Flag Lifecycle
-
-1. **Development:** Default `false`
-2. **Testing:** Manually enable with env var
-3. **Beta:** Default `true`, but can disable
-4. **Stable:** Remove flag, delete legacy code
-
----
-
-## Documentation Standards
-
-### Code Comments
-
-**Explain WHY, not WHAT:**
-
-```python
-# ✅ GOOD - Explains rationale
-# Stop current song before playing next to ensure clean transition
-# Without this, Sonos sometimes skips or stutters
-self.sonos.stop()
-
-# ❌ BAD - States the obvious
-# Call stop function
-self.sonos.stop()
-```
-
-### Docstrings
-
-**Use comprehensive docstrings for public methods:**
-
-```python
-def _handle_add_album(self, data: Dict):
-    """
-    Add entire album to queue.
-    
-    Args:
-        data: Dict containing 'album_id'
-        
-    Auto-starts playback if queue was empty and controller is in PLAYING state.
-    Sends queue_changed SSE event.
-    """
-```
-
-### README Updates
-
-**Update README when:**
-- Adding new features
-- Changing configuration
-- Adding dependencies
-- Modifying architecture
-
----
-
-## Performance Guidelines
-
-### Acceptable Latencies
-
-- Command queueing: < 5ms
-- Command processing: < 50ms
-- SSE event delivery: < 100ms
-- API response: < 200ms
-- State poll: < 10ms
-
-### Optimization Priorities
-
-1. **Correctness** - Never sacrifice reliability for speed
-2. **Responsiveness** - Users notice >100ms delays
-3. **Resource Usage** - But don't optimize prematurely
-
-### Memory Management
-
-```python
-# ✅ GOOD - Limit queue size
-MAX_QUEUE_SIZE = 1000
-if len(self.musicqueue) >= MAX_QUEUE_SIZE:
-    log.warning("Queue at maximum size")
-    return
-
-# ❌ BAD - Unbounded growth
-self.musicqueue.extend(infinite_songs)  # Memory leak!
-```
-
----
-
-## Debugging Techniques
-
-### Enable Verbose Logging
-
-```python
-# Temporarily increase log level
-logging.basicConfig(level=logging.DEBUG)
-```
-
-### Use /stats Endpoint
-
-```bash
-# Check controller health
-curl http://localhost:8000/stats
-{
-    "commands_processed": 150,
-    "auto_plays": 45,
-    "state": "PLAYING"
-}
-```
-
-### Monitor SSE Events
-
-```javascript
-// Log all SSE events
-eventSource.onmessage = (e) => {
-    console.log('SSE:', e.type, e.data);
-};
-```
-
-### Use listen.py Tool
-
-```bash
-# Monitor Sonos events directly
-python3 tools/listen.py
-```
-
----
-
-## Git Workflow
-
-### Commit Messages
-
-**Use conventional commit format:**
-
-```
-feat: Add external source state indicator
-fix: Prevent song skipping in /next endpoint
-docs: Update API documentation for /location
-refactor: Extract command processing to separate module
-test: Add tests for queue management
-```
-
-### Branch Strategy
-
-- `main` - Stable releases
-- `dev` - Integration branch
-- `feature/*` - New features
-- `fix/*` - Bug fixes
-
-### Before Committing
-
-1. Test with `USE_NEW_CONTROLLER=true`
-2. Test with `USE_NEW_CONTROLLER=false`
-3. Check for console errors
-4. Update relevant documentation
-5. Run tests if available
-
----
-
-## AI-Specific Guidelines
-
-### Understanding Context
-
-**Read these files first when starting:**
-1. `API.md` - Full API reference and architecture
-2. `RELEASE.md` - Recent changes and history
-3. `README.md` - Project overview
-4. This file (`CLAUDE.md`) - Development guidelines
-
-### Making Changes
-
-**Before modifying code:**
-1. Understand the command-queue pattern
-2. Identify which component to change (server/adapter/controller)
-3. Consider backward compatibility
-4. Plan SSE event updates
-5. Think about frontend implications
-
-**When adding features:**
-1. Add feature flag if significant
-2. Update API.md documentation
-3. Update RELEASE.md changelog
-4. Add logging at appropriate levels
-5. Consider monitoring/stats
-
-**When fixing bugs:**
-1. Identify root cause (race condition? state mismatch? Sonos issue?)
-2. Fix in appropriate layer (controller for state, adapter for API)
-3. Add logging to prevent recurrence
-4. Test both feature flag states
-5. Document the fix
-
-### Code Review Checklist
-
-Before suggesting code changes, verify:
-
-- [ ] No race conditions introduced
-- [ ] Backward compatible (or feature-flagged)
-- [ ] Proper error handling
-- [ ] Appropriate logging
-- [ ] SSE events sent when state changes
-- [ ] Frontend updated if needed
-- [ ] Documentation updated
-- [ ] Consistent with existing patterns
-
-### Communication Style
-
-**Be specific and actionable:**
-
-```
-✅ GOOD:
-"The issue is in controller.py line 234. The state check happens 
-after the Sonos call, but should happen before to respect user 
-commands. Move the `if self.state == "PLAYING"` check above 
-the `sonos.play_uri()` call."
-
-❌ BAD:
-"There's a bug in the controller that needs fixing."
-```
-
-**Explain rationale:**
-
-```
-✅ GOOD:
-"We should poll every 0.5s instead of 1s because Sonos can 
-transition between songs in under 1 second, and we need to 
-catch those transitions to auto-play the next song."
-
-❌ BAD:
-"Change the sleep to 0.5 seconds."
-```
-
-### Common Questions to Ask
-
-When analyzing the code:
-
-1. Does this operation modify state? → Use command queue
-2. Does this need UI update? → Send SSE event
-3. Can Sonos fail here? → Add try/except
-4. Is this a critical path? → Add extensive logging
-5. Does this change behavior? → Add feature flag
-6. Will users notice delay? → Optimize or make async
-
----
-
-## Project History Context
-
-### Why This Architecture?
-
-**Original Problem:**
-- Users reported songs skipping when clicking "next"
-- Queue would lose songs randomly
-- Playback would stop after one song
-
-**Root Cause:**
-- Race condition between jukebox thread and `/next` endpoint
-- Both threads popping from same queue simultaneously
-- No synchronization mechanism
-
-**Solution Evolution:**
-1. Analyzed architecture (identified race condition)
-2. Proposed command-queue pattern
-3. Implemented controller with single-threaded processing
-4. Added monitoring thread for auto-play
-5. Integrated with feature flag for safety
-6. Enhanced with "supreme master" takeover mode
-
-### Key Decisions
-
-**Single-threaded controller:**
-- Eliminates ALL race conditions
-- Simplifies state management
-- Predictable operation ordering
-
-**0.5 second polling:**
-- Matches original jukebox frequency
-- Catches song endings reliably
-- Overhead is negligible
-
-**Feature flag:**
-- Allows instant rollback
-- De-risks deployment
-- Enables gradual migration
-
-**Internal state tracking:**
-- Sonos hardware state is unreliable
-- Controller knows the truth
-- Override Sonos when necessary
-
----
-
-## Success Metrics
-
-### What "Good" Looks Like
-
-**Reliability:**
-- Zero song skips in normal operation
-- Auto-play success rate > 99%
-- Controller uptime matches server uptime
-
-**Performance:**
-- API response < 200ms
-- SSE events delivered < 100ms
-- Song transitions < 2 seconds
-
-**User Experience:**
-- UI updates within 100ms of state change
-- Album art always displays
-- Queue display always accurate
-
-**Code Quality:**
-- All public methods documented
-- Error handling on every Sonos call
-- Logging for all state transitions
-- Tests for critical paths
-
----
-
-## Resources
-
-### Key Files
-- `API.md` - Complete API reference
-- `RELEASE.md` - Version history
-- `README.md` - User documentation
-- `src/controller.py` - Core playback logic
-- `tests/mock_sonos.py` - Testing without hardware
-
-### External Documentation
-- [SoCo Library](https://github.com/SoCo/SoCo) - Sonos control
-- [Sonos API](https://developer.sonos.com/) - Official docs
-- [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) - SSE spec
-
-### Tools
-- `tools/listen.py` - Monitor Sonos events
-- `tools/check_metadata.py` - Verify audio file metadata
-- `tests/test_controller.py` - Controller unit tests
-
----
-
-## Final Thoughts
-
-### The TinySonos Way
-
-1. **Reliability First** - Skip-free playback is the entire point
-2. **Trust Internal State** - Sonos hardware lies, believe the controller
-3. **Serialize Operations** - Command queue eliminates races
-4. **Monitor Aggressively** - Poll frequently, catch everything
-5. **Fail Gracefully** - Sonos will fail, handle it elegantly
-6. **Stay Observable** - Log everything, expose stats
-7. **Keep It Simple** - Complexity is the enemy of reliability
-
-### When In Doubt
-
-- Add more logging
-- Check the command queue
-- Trust the controller state
-- Test with feature flag both ways
-- Read the Sonos docs again (they're often wrong)
-- Remember: it's probably a race condition
-
----
-
-**Welcome to TinySonos development! May your playlists never skip. 🎵**
+> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
+> This section is managed by `generate-claude-profile` -- do not edit manually.
+<!-- GSD:profile-end -->
